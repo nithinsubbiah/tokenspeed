@@ -66,6 +66,7 @@ class AttentionConfig:
     DEEP_PIPELINE: gl.constexpr
     PACKED_GQA: gl.constexpr
     GUARDED_QUERY_ROWS: gl.constexpr
+    COMPACT_RAGGED: gl.constexpr
     WIDE_ADDRESSING: gl.constexpr
     FIXED_REFERENCE: gl.constexpr
     DISABLE_XDL_ARB_STALL: gl.constexpr
@@ -102,6 +103,7 @@ class AttentionConfig:
         DEEP_PIPELINE,
         PACKED_GQA,
         GUARDED_QUERY_ROWS,
+        COMPACT_RAGGED,
         WIDE_ADDRESSING,
         FIXED_REFERENCE,
         DISABLE_XDL_ARB_STALL,
@@ -155,6 +157,7 @@ class AttentionConfig:
         self.DEEP_PIPELINE = gl.constexpr(DEEP_PIPELINE)
         self.PACKED_GQA = gl.constexpr(PACKED_GQA)
         self.GUARDED_QUERY_ROWS = gl.constexpr(GUARDED_QUERY_ROWS)
+        self.COMPACT_RAGGED = gl.constexpr(COMPACT_RAGGED)
         self.WIDE_ADDRESSING = gl.constexpr(WIDE_ADDRESSING)
         self.FIXED_REFERENCE = gl.constexpr(FIXED_REFERENCE)
         self.DISABLE_XDL_ARB_STALL = gl.constexpr(DISABLE_XDL_ARB_STALL)
@@ -251,12 +254,37 @@ class AttentionProgram:
 
     @gluon.jit
     def create(cfg, q_ptr, k_ptr, v_ptr, output_ptr, sink_ptr, lse_ptr, cu_seqlens_ptr):
-        batch = gl.program_id(0)
         head_program = gl.program_id(1)
-        q_block = gl.program_id(2)
-        if cfg.REVERSE_Q_BLOCKS:
-            q_block = gl.num_programs(axis=2) - 1 - q_block
         group_size: gl.constexpr = cfg.N_HEADS // cfg.N_KV_HEADS
+        if cfg.COMPACT_RAGGED:
+            # The measured ragged route has four sequences. Compact their live
+            # query blocks onto axis 2 instead of launching a max-seqlen
+            # rectangle with empty workgroups for every shorter sequence.
+            task = gl.program_id(2)
+            q_block = task * 0
+            seq_base = gl.load(cu_seqlens_ptr)
+            seq_end = gl.load(cu_seqlens_ptr + 1)
+            prefix = task * 0
+            for batch_idx in gl.static_range(4):
+                batch_base = gl.load(cu_seqlens_ptr + batch_idx)
+                batch_end = gl.load(cu_seqlens_ptr + batch_idx + 1)
+                batch_len = batch_end - batch_base
+                num_q_blocks = (batch_len * group_size + cfg.BLOCK_M - 1) // cfg.BLOCK_M
+                selected = (task >= prefix) & (task < prefix + num_q_blocks)
+                local_q_block = task - prefix
+                if cfg.REVERSE_Q_BLOCKS:
+                    local_q_block = num_q_blocks - 1 - local_q_block
+                q_block = gl.where(selected, local_q_block, q_block)
+                seq_base = gl.where(selected, batch_base, seq_base)
+                seq_end = gl.where(selected, batch_end, seq_end)
+                prefix += num_q_blocks
+        else:
+            batch = gl.program_id(0)
+            q_block = gl.program_id(2)
+            if cfg.REVERSE_Q_BLOCKS:
+                q_block = gl.num_programs(axis=2) - 1 - q_block
+            seq_base = gl.load(cu_seqlens_ptr + batch)
+            seq_end = gl.load(cu_seqlens_ptr + batch + 1)
         if cfg.PACKED_GQA:
             kv_head = head_program
             q_head = kv_head * group_size
@@ -265,8 +293,6 @@ class AttentionProgram:
             q_head = head_program
             kv_head = q_head // group_size
             q_start = q_block * cfg.BLOCK_M
-        seq_base = gl.load(cu_seqlens_ptr + batch)
-        seq_end = gl.load(cu_seqlens_ptr + batch + 1)
         seq_len = seq_end - seq_base
         if cfg.WIDE_ADDRESSING:
             query_token_base = seq_base + q_start
@@ -1006,6 +1032,7 @@ def gluon_mha_prefill_gfx1250(
     DEEP_PIPELINE: gl.constexpr,
     PACKED_GQA: gl.constexpr,
     GUARDED_QUERY_ROWS: gl.constexpr,
+    COMPACT_RAGGED: gl.constexpr,
     WIDE_ADDRESSING: gl.constexpr,
     FIXED_REFERENCE: gl.constexpr,
     DISABLE_XDL_ARB_STALL: gl.constexpr,
@@ -1032,6 +1059,7 @@ def gluon_mha_prefill_gfx1250(
         DEEP_PIPELINE,
         PACKED_GQA,
         GUARDED_QUERY_ROWS,
+        COMPACT_RAGGED,
         WIDE_ADDRESSING,
         FIXED_REFERENCE,
         DISABLE_XDL_ARB_STALL,
@@ -1251,6 +1279,31 @@ def _select_fixed_reference(
     )
 
 
+def _select_disable_xdl_arb_stall(
+    *,
+    dtype: torch.dtype,
+    window_left: int,
+    uniform: bool,
+    guarded_query_rows: bool,
+    num_warps: int,
+    waves_per_eu: int,
+) -> bool:
+    """Disable the arbitration delay only for measured schedules."""
+    if num_warps != 4:
+        return False
+    if dtype == torch.bfloat16 and window_left < 0:
+        return (uniform and not guarded_query_rows and waves_per_eu == 0) or (
+            guarded_query_rows and waves_per_eu == 2
+        )
+    return (
+        dtype == torch.float16
+        and window_left == 512
+        and uniform
+        and not guarded_query_rows
+        and waves_per_eu == 2
+    )
+
+
 def _select_m_tile(
     *, batch_size: int, n_heads: int, max_seqlen: int
 ) -> tuple[int, int]:
@@ -1421,8 +1474,8 @@ def launch_gluon_mha_prefill_gfx1250(
     )
     fixed_reference = False
     fast_four_wave = False
+    uniform = all(seqlen == config.max_seqlen for seqlen in seqlens)
     if selected_packed_gqa:
-        uniform = all(seqlen == config.max_seqlen for seqlen in seqlens)
         fixed_reference_capable = _select_fixed_reference(
             dtype=q.dtype,
             batch_size=config.batch_size,
@@ -1499,6 +1552,26 @@ def launch_gluon_mha_prefill_gfx1250(
         max_seqlen=config.max_seqlen,
         block_m=config.block_m,
     )
+    compact_ragged = selected_packed_gqa and guarded_query_rows
+    if compact_ragged:
+        config = config._replace(
+            grid=(
+                1,
+                config.n_kv_heads,
+                sum(
+                    triton_cdiv(seqlen * packed_group_size, config.block_m)
+                    for seqlen in seqlens
+                ),
+            )
+        )
+    disable_xdl_arb_stall = _select_disable_xdl_arb_stall(
+        dtype=q.dtype,
+        window_left=config.window_left,
+        uniform=uniform,
+        guarded_query_rows=guarded_query_rows,
+        num_warps=config.num_warps,
+        waves_per_eu=config.waves_per_eu,
+    )
     if selected_packed_gqa:
         tdm_warp_hint = guarded_query_rows or fast_four_wave
         reverse_q_blocks = True
@@ -1509,10 +1582,14 @@ def launch_gluon_mha_prefill_gfx1250(
         deep_pipeline = False
     if selected_packed_gqa:
         if config.window_left >= 0:
-            llvm_fn_attrs = "amdgpu-sched-strategy=max-memory-clause"
-        elif guarded_query_rows or (
-            q.dtype == torch.float16 and config.max_seqlen > 1024
-        ):
+            llvm_fn_attrs = (
+                "amdgpu-sched-strategy=coexec"
+                if q.dtype == torch.float16 and config.window_left == 512
+                else "amdgpu-sched-strategy=max-memory-clause"
+            )
+        elif guarded_query_rows and q.dtype == torch.bfloat16:
+            llvm_fn_attrs = "amdgpu-sched-strategy=coexec"
+        elif q.dtype == torch.float16 and config.max_seqlen > 1024:
             llvm_fn_attrs = "amdgpu-sched-strategy=max-ilp"
         else:
             llvm_fn_attrs = "amdgpu-sched-strategy=coexec"
@@ -1563,9 +1640,10 @@ def launch_gluon_mha_prefill_gfx1250(
         deep_pipeline,
         config.packed_gqa,
         guarded_query_rows,
+        compact_ragged,
         wide_addressing,
         fixed_reference,
-        fast_four_wave,
+        disable_xdl_arb_stall,
         config.num_warps,
         config.num_buffers,
         num_warps=config.num_warps,

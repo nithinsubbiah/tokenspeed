@@ -192,6 +192,79 @@ def test_mha_prefill_packed_gqa(dtype, group_size):
     torch.testing.assert_close(out.float(), expected, rtol=8e-2, atol=8e-2)
 
 
+def test_mha_prefill_compact_ragged():
+    device, dtype = "cuda", torch.bfloat16
+    seqlens = [65, 49, 33, 17]
+    n_q_heads, n_kv_heads, head_dim = 8, 1, 128
+    q, k, v, cu, cu_cpu, max_seqlen = _inputs(
+        seqlens, n_q_heads, n_kv_heads, head_dim, device, dtype
+    )
+
+    original_selector = prefill._select_packed_gqa
+    prefill._select_packed_gqa = lambda **_: True
+    try:
+        out = prefill.launch_gluon_mha_prefill_gfx1250(q, k, v, cu, cu_cpu, max_seqlen)
+    finally:
+        prefill._select_packed_gqa = original_selector
+
+    expected = _reference(q, k, v, cu_cpu, n_q_heads, n_kv_heads, head_dim)
+    torch.testing.assert_close(out.float(), expected, rtol=8e-2, atol=8e-2)
+
+
+@pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.float8_e5m2])
+def test_mha_prefill_fp8_fallback(dtype):
+    device = "cuda"
+    seqlens = [129]
+    n_q_heads, n_kv_heads, head_dim = 4, 1, 128
+    q, k, v, cu, cu_cpu, max_seqlen = _inputs(
+        seqlens, n_q_heads, n_kv_heads, head_dim, device, torch.bfloat16
+    )
+    q, k, v = (tensor.mul(0.5).to(dtype) for tensor in (q, k, v))
+
+    out = prefill.launch_gluon_mha_prefill_gfx1250(q, k, v, cu, cu_cpu, max_seqlen)
+
+    assert out.dtype == torch.bfloat16
+    expected = _reference(q, k, v, cu_cpu, n_q_heads, n_kv_heads, head_dim)
+    torch.testing.assert_close(out.float(), expected, rtol=2e-1, atol=2e-1)
+
+
+def test_mha_prefill_sinks_and_lse_fallback():
+    device, dtype = "cuda", torch.bfloat16
+    seqlens = [129]
+    n_q_heads, n_kv_heads, head_dim = 4, 1, 128
+    q, k, v, cu, cu_cpu, max_seqlen = _inputs(
+        seqlens, n_q_heads, n_kv_heads, head_dim, device, dtype
+    )
+    sinks = torch.linspace(-2.0, 2.0, n_q_heads, device=device)
+
+    out, lse = prefill.launch_gluon_mha_prefill_gfx1250(
+        q,
+        k,
+        v,
+        cu,
+        cu_cpu,
+        max_seqlen,
+        sinks=sinks,
+        return_lse=True,
+    )
+
+    scale = 1.0 / math.sqrt(head_dim)
+    k_exp = k.float().repeat_interleave(n_q_heads // n_kv_heads, dim=1)
+    v_exp = v.float().repeat_interleave(n_q_heads // n_kv_heads, dim=1)
+    scores = torch.einsum("qhd,khd->hqk", q.float(), k_exp) * scale
+    pos = torch.arange(seqlens[0], device=device)
+    scores.masked_fill_(~(pos[:, None] >= pos[None, :])[None, :, :], float("-inf"))
+    scores_with_sink = torch.cat(
+        (scores, sinks[:, None, None].expand(-1, seqlens[0], 1)), dim=-1
+    )
+    probabilities = torch.softmax(scores_with_sink, dim=-1)[..., :-1]
+    expected = torch.einsum("hqk,khd->qhd", probabilities, v_exp)
+    expected_lse = torch.logsumexp(scores_with_sink, dim=-1).transpose(0, 1)
+
+    torch.testing.assert_close(out.float(), expected, rtol=8e-2, atol=8e-2)
+    torch.testing.assert_close(lse, expected_lse, rtol=1e-3, atol=1e-3)
+
+
 def test_mha_prefill_addresses_past_four_gib():
     """Sequence and head bases must not wrap through 32-bit buffer offsets."""
     device, dtype = "cuda", torch.bfloat16
@@ -255,6 +328,7 @@ def test_mha_prefill_addresses_past_four_gib():
         False,
         False,
         -1,
+        False,
         False,
         False,
         False,
@@ -423,6 +497,41 @@ def test_select_fixed_reference():
         {"n_heads": 16, "n_kv_heads": 2},
     ):
         assert not prefill._select_fixed_reference(**(kwargs | override))
+
+
+def test_select_disable_xdl_arb_stall():
+    kwargs = {
+        "dtype": torch.bfloat16,
+        "window_left": -1,
+        "uniform": True,
+        "guarded_query_rows": False,
+        "num_warps": 4,
+        "waves_per_eu": 0,
+    }
+    assert prefill._select_disable_xdl_arb_stall(**kwargs)
+    assert prefill._select_disable_xdl_arb_stall(
+        **(
+            kwargs
+            | {
+                "uniform": False,
+                "guarded_query_rows": True,
+                "waves_per_eu": 2,
+            }
+        )
+    )
+    assert prefill._select_disable_xdl_arb_stall(
+        **(kwargs | {"dtype": torch.float16, "window_left": 512, "waves_per_eu": 2})
+    )
+
+    for override in (
+        {"dtype": torch.float16},
+        {"window_left": 512},
+        {"uniform": False},
+        {"guarded_query_rows": True},
+        {"num_warps": 8},
+        {"waves_per_eu": 2},
+    ):
+        assert not prefill._select_disable_xdl_arb_stall(**(kwargs | override))
 
 
 def test_select_tdm_warp_hint():
